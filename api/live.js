@@ -33,7 +33,7 @@ export default async function handler(req, res) {
 
   const { channel, url: proxyTarget } = req.query;
 
-  // 1. التعامل مع البروكسي (جلب قطع الـ TS والـ M3U8 الفرعية)
+  // 1. بروكسي الأجزاء بنظام التدفق المباشر (Streaming Pipe) لمنع التقطيع نهائياً
   if (proxyTarget) {
     try {
       const upstreamRes = await fetch(proxyTarget, {
@@ -51,9 +51,16 @@ export default async function handler(req, res) {
         }
       });
       setCorsHeaders(res);
+      res.setHeader("Cache-Control", "no-cache");
 
-      const buffer = Buffer.from(await upstreamRes.arrayBuffer());
-      return res.send(buffer);
+      // تحويل الاستجابة مباشرة للمشغل بدون انتظار (Stream)
+      const reader = upstreamRes.body.getReader();
+      while (true) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        res.write(value);
+      }
+      return res.end();
     } catch (e) {
       return res.status(500).json({ error: `Proxy Error: ${e.message}` });
     }
@@ -81,7 +88,7 @@ export default async function handler(req, res) {
       const tHeader = apiRes.headers.get("t");
 
       if (!tHeader) {
-        return res.protocolVersion ? res.status(403).send("Security token 't' missing") : res.status(403).send("Security token 't' missing");
+        return res.status(403).send("Security token 't' missing");
       }
 
       const decrypted = decrypt(encryptedText, XOR_KEY + tHeader);
@@ -143,5 +150,5 @@ export default async function handler(req, res) {
     }
   }
 
-  return res.status(200).send("Vercel IQTV Engine Online");
+  return res.status(200).send("Vercel IQTV Streaming Engine Online");
 }
