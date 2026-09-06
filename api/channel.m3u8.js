@@ -1,215 +1,49 @@
-
-const API_BASE = "https://def.yacinelive.com";
-const XOR_KEY = "c!xZj+N9&G@Ev@vw";
-
-const USER_AGENT =
-  "Mozilla/5.0 (Windows NT 10.0; Win64; x64) " +
-  "AppleWebKit/537.36 (KHTML, like Gecko) " +
-  "Chrome/139.0.0.0 Safari/537.36";
-
-const REFERER = "https://x.com/";
-
-function decrypt(base64, key) {
-  const buffer = Buffer.from(
-    base64.trim(),
-    "base64"
-  );
-
-  let result = "";
-
-  for (let i = 0; i < buffer.length; i++) {
-    result += String.fromCharCode(
-      buffer[i] ^
-      key.charCodeAt(i % key.length)
-    );
-  }
-
-  return result;
-}
+const ORIGIN_M3U8 =
+  "https://def.yacinelive.com";
 
 export default async function handler(req, res) {
   try {
-    const channelId =
-      req.query?.id || "4";
-
-    // جلب بيانات القناة
-    const apiResponse = await fetch(
-      `${API_BASE}/api/channel/${encodeURIComponent(channelId)}`,
-      {
-        headers: {
-          "User-Agent": USER_AGENT,
-          "Accept": "*/*"
-        },
-        cache: "no-store"
+    const response = await fetch(ORIGIN_M3U8, {
+      headers: {
+        "User-Agent": "Mozilla/5.0",
+        "Accept": "*/*"
       }
-    );
+    });
 
-    if (!apiResponse.ok) {
-      return res.status(502).send(
-        `API Error: ${apiResponse.status}`
-      );
+    if (!response.ok) {
+      return res.status(response.status).send("Origin error");
     }
 
-    const encrypted =
-      await apiResponse.text();
+    const text = await response.text();
 
-    const timestamp =
-      apiResponse.headers.get("t");
+    const base = new URL(ORIGIN_M3U8);
 
-    if (!timestamp) {
-      return res.status(502).send(
-        "Missing t header"
-      );
-    }
+    const rewritten = text
+      .split("\n")
+      .map(line => {
+        const value = line.trim();
 
-    // فك البيانات
-    const decrypted =
-      decrypt(
-        encrypted,
-        XOR_KEY + timestamp
-      );
-
-    let data;
-
-    try {
-      data = JSON.parse(decrypted);
-    } catch {
-      return res.status(502).send(
-        "Invalid API response"
-      );
-    }
-
-    const channel =
-      data?.data?.[0] ||
-      data?.data ||
-      data?.channel ||
-      data;
-
-    const streamUrl =
-      channel?.url ||
-      channel?.stream_url ||
-      channel?.stream ||
-      channel?.link;
-
-    if (!streamUrl) {
-      return res.status(404).send(
-        "Stream URL not found"
-      );
-    }
-
-    // متابعة التحويل
-    const redirectResponse =
-      await fetch(
-        streamUrl,
-        {
-          redirect: "manual",
-          headers: {
-            "User-Agent": USER_AGENT,
-            "Referer": REFERER,
-            "Accept": "*/*"
-          },
-          cache: "no-store"
+        if (!value || value.startsWith("#")) {
+          return line;
         }
-      );
 
-    const location =
-      redirectResponse.headers.get(
-        "location"
-      );
+        try {
+          const segmentUrl = new URL(value, base).href;
 
-    const finalUrl =
-      location
-        ? new URL(
-            location,
-            streamUrl
-          ).href
-        : streamUrl;
-
-    // جلب الـM3U8
-    const playlistResponse =
-      await fetch(
-        finalUrl,
-        {
-          headers: {
-            "User-Agent": USER_AGENT,
-            "Referer": REFERER,
-            "Accept": "*/*"
-          },
-          cache: "no-store"
+          return `/api/stream?url=${encodeURIComponent(segmentUrl)}`;
+        } catch {
+          return line;
         }
-      );
+      })
+      .join("\n");
 
-    if (!playlistResponse.ok) {
-      return res.status(
-        playlistResponse.status
-      ).send(
-        `Playlist Error: ${playlistResponse.status}`
-      );
-    }
+    res.setHeader("Content-Type", "application/vnd.apple.mpegurl");
+    res.setHeader("Cache-Control", "no-store, no-cache, must-revalidate");
 
-    const playlist =
-      await playlistResponse.text();
-
-    if (!playlist.includes("#EXTM3U")) {
-      return res.status(502).send(
-        "Invalid M3U8 playlist"
-      );
-    }
-
-    /*
-     * مهم:
-     * نخلي روابط الـsegments الأصلية.
-     * ما نسوي Proxy للـsegments.
-     *
-     * هذا يقلل الضغط والتأخير على Vercel.
-     */
-
-    res.setHeader(
-      "Content-Type",
-      "application/vnd.apple.mpegurl"
-    );
-
-    res.setHeader(
-      "Access-Control-Allow-Origin",
-      "*"
-    );
-
-    res.setHeader(
-      "Access-Control-Allow-Methods",
-      "GET, OPTIONS"
-    );
-
-    res.setHeader(
-      "Access-Control-Allow-Headers",
-      "*"
-    );
-
-    res.setHeader(
-      "Cache-Control",
-      "no-store, no-cache, must-revalidate"
-    );
-
-    res.setHeader(
-      "Pragma",
-      "no-cache"
-    );
-
-    res.setHeader(
-      "Expires",
-      "0"
-    );
-
-    return res
-      .status(200)
-      .send(playlist);
+    return res.status(200).send(rewritten);
 
   } catch (error) {
-
     console.error(error);
-
-    return res.status(500).send(
-      "Server Error: " +
-      error.message
-    );
+    return res.status(500).send("Proxy error");
   }
 }
