@@ -1,63 +1,86 @@
 const API_BASE = "https://def.yacinelive.com";
 const XOR_KEY = "c!xZj+N9&G@Ev@vw";
 
-const UA =
+const USER_AGENT =
   "Mozilla/5.0 (Windows NT 10.0; Win64; x64) " +
   "AppleWebKit/537.36 (KHTML, like Gecko) " +
   "Chrome/139.0.0.0 Safari/537.36";
 
-function decrypt(base64, key) {
-  const data = Buffer.from(base64.trim(), "base64");
-  let out = "";
+const REFERER = "https://x.com/";
 
-  for (let i = 0; i < data.length; i++) {
-    out += String.fromCharCode(
-      data[i] ^ key.charCodeAt(i % key.length)
+function decrypt(base64, key) {
+  const buffer = Buffer.from(base64.trim(), "base64");
+
+  let result = "";
+
+  for (let i = 0; i < buffer.length; i++) {
+    result += String.fromCharCode(
+      buffer[i] ^
+      key.charCodeAt(i % key.length)
     );
   }
 
-  return out;
+  return result;
 }
 
 export default async function handler(req, res) {
   try {
-    const id = req.query?.id || "4";
+    const channelId = req.query?.id || "4";
 
-    const api = await fetch(
-      `${API_BASE}/api/channel/${encodeURIComponent(id)}`,
+    // 1. جلب بيانات القناة
+    const apiResponse = await fetch(
+      `${API_BASE}/api/channel/${encodeURIComponent(channelId)}`,
       {
         headers: {
-          "User-Agent": UA,
+          "User-Agent": USER_AGENT,
           "Accept": "*/*"
         },
         cache: "no-store"
       }
     );
 
-    if (!api.ok) {
-      return res.status(502).send("Source API error");
+    if (!apiResponse.ok) {
+      return res
+        .status(502)
+        .send("Source API error: " + apiResponse.status);
     }
 
-    const encrypted = await api.text();
-    const timestamp = api.headers.get("t");
+    // 2. قراءة البيانات المشفرة
+    const encrypted = await apiResponse.text();
+
+    // 3. قراءة timestamp من Header t
+    const timestamp = apiResponse.headers.get("t");
 
     if (!timestamp) {
-      return res.status(502).send("Missing source timestamp");
+      return res
+        .status(502)
+        .send("Missing source timestamp");
     }
 
+    // 4. فك التشفير
     const decrypted = decrypt(
       encrypted,
       XOR_KEY + timestamp
     );
 
-    const data = JSON.parse(decrypted);
+    let data;
 
+    try {
+      data = JSON.parse(decrypted);
+    } catch {
+      return res
+        .status(502)
+        .send("Invalid decrypted JSON");
+    }
+
+    // 5. استخراج بيانات القناة
     const channel =
       data?.data?.[0] ||
       data?.data ||
       data?.channel ||
       data;
 
+    // 6. استخراج رابط البث
     const streamUrl =
       channel?.url ||
       channel?.stream_url ||
@@ -65,63 +88,68 @@ export default async function handler(req, res) {
       channel?.link;
 
     if (!streamUrl) {
-      return res.status(404).send("Stream not found");
+      return res
+        .status(404)
+        .send("Stream URL not found");
     }
 
-    const redirect = await fetch(streamUrl, {
-      redirect: "manual",
-      headers: {
-        "User-Agent": UA,
-        "Referer": "https://x.com/",
-        "Accept": "*/*"
-      },
-      cache: "no-store"
-    });
+    // 7. متابعة Redirect
+    const redirectResponse = await fetch(
+      streamUrl,
+      {
+        redirect: "manual",
 
-    const location = redirect.headers.get("location");
+        headers: {
+          "User-Agent": USER_AGENT,
+          "Referer": REFERER,
+          "Accept": "*/*"
+        },
+
+        cache: "no-store"
+      }
+    );
+
+    const location =
+      redirectResponse.headers.get("location");
 
     const finalUrl = location
       ? new URL(location, streamUrl).href
       : streamUrl;
 
-    const playlistResponse = await fetch(finalUrl, {
-      headers: {
-        "User-Agent": UA,
-        "Referer": "https://x.com/",
-        "Accept": "*/*"
-      },
-      cache: "no-store"
-    });
+    // 8. جلب الـ M3U8
+    const playlistResponse = await fetch(
+      finalUrl,
+      {
+        headers: {
+          "User-Agent": USER_AGENT,
+          "Referer": REFERER,
+          "Accept": "*/*"
+        },
+
+        cache: "no-store"
+      }
+    );
 
     if (!playlistResponse.ok) {
       return res
         .status(playlistResponse.status)
-        .send("Playlist error");
+        .send(
+          "Playlist error: " +
+          playlistResponse.status
+        );
     }
 
-    const playlist = await playlistResponse.text();
+    const playlist =
+      await playlistResponse.text();
 
-    const base = new URL(finalUrl);
+    // 9. التأكد أنه M3U8
+    if (!playlist.includes("#EXTM3U")) {
+      return res
+        .status(502)
+        .send("Invalid M3U8 playlist");
+    }
 
-    const rewritten = playlist
-      .split(/\r?\n/)
-      .map(line => {
-        const value = line.trim();
-
-        if (!value || value.startsWith("#")) {
-          return line;
-        }
-
-        try {
-          const segment = new URL(value, base).href;
-
-          return `/api/segment?url=${encodeURIComponent(segment)}`;
-        } catch {
-          return line;
-        }
-      })
-      .join("\n");
-
+    // 10. Headers
     res.setHeader(
       "Content-Type",
       "application/vnd.apple.mpegurl"
@@ -133,15 +161,44 @@ export default async function handler(req, res) {
     );
 
     res.setHeader(
-      "Cache-Control",
-      "no-store, no-cache, must-revalidate"
+      "Access-Control-Allow-Methods",
+      "GET, OPTIONS"
     );
 
-    return res.status(200).send(rewritten);
+    res.setHeader(
+      "Access-Control-Allow-Headers",
+      "*"
+    );
 
-  } catch (e) {
+    res.setHeader(
+      "Cache-Control",
+      "no-store, no-cache, must-revalidate, proxy-revalidate"
+    );
+
+    res.setHeader(
+      "Pragma",
+      "no-cache"
+    );
+
+    res.setHeader(
+      "Expires",
+      "0"
+    );
+
+    // 11. إرجاع الـ M3U8 الأصلي
+    return res
+      .status(200)
+      .send(playlist);
+
+  } catch (error) {
+
+    console.error(error);
+
     return res
       .status(500)
-      .send("Error: " + e.message);
+      .send(
+        "Server error: " +
+        error.message
+      );
   }
 }
