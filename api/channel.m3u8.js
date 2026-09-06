@@ -1,3 +1,4 @@
+
 const API_BASE = "https://def.yacinelive.com";
 const XOR_KEY = "c!xZj+N9&G@Ev@vw";
 
@@ -9,196 +10,418 @@ const USER_AGENT =
 const REFERER = "https://x.com/";
 
 function decrypt(base64, key) {
-  const buffer = Buffer.from(base64.trim(), "base64");
+  const bytes = Uint8Array.from(
+    atob(base64.trim()),
+    c => c.charCodeAt(0)
+  );
 
   let result = "";
 
-  for (let i = 0; i < buffer.length; i++) {
+  for (let i = 0; i < bytes.length; i++) {
     result += String.fromCharCode(
-      buffer[i] ^
-      key.charCodeAt(i % key.length)
+      bytes[i] ^ key.charCodeAt(i % key.length)
     );
   }
 
   return result;
 }
 
-export default async function handler(req, res) {
-  try {
-    const channelId = req.query?.id || "4";
+async function getStreamUrl(channelId) {
+  const response = await fetch(
+    `${API_BASE}/api/channel/${encodeURIComponent(channelId)}`,
+    {
+      headers: {
+        "User-Agent": USER_AGENT,
+        "Accept": "*/*"
+      },
+      cf: {
+        cacheTtl: 0,
+        cacheEverything: false
+      }
+    }
+  );
 
-    // 1. جلب بيانات القناة
-    const apiResponse = await fetch(
-      `${API_BASE}/api/channel/${encodeURIComponent(channelId)}`,
+  if (!response.ok) {
+    throw new Error(
+      `API ${response.status}`
+    );
+  }
+
+  const encrypted = await response.text();
+
+  const timestamp =
+    response.headers.get("t");
+
+  if (!timestamp) {
+    throw new Error("Missing t header");
+  }
+
+  const decrypted = decrypt(
+    encrypted,
+    XOR_KEY + timestamp
+  );
+
+  const data = JSON.parse(decrypted);
+
+  const channel =
+    data?.data?.[0] ||
+    data?.data ||
+    data?.channel ||
+    data;
+
+  const streamUrl =
+    channel?.url ||
+    channel?.stream_url ||
+    channel?.stream ||
+    channel?.link;
+
+  if (!streamUrl) {
+    throw new Error("Stream URL not found");
+  }
+
+  return streamUrl;
+}
+
+async function getFinalUrl(streamUrl) {
+  const response = await fetch(
+    streamUrl,
+    {
+      redirect: "manual",
+      headers: {
+        "User-Agent": USER_AGENT,
+        "Referer": REFERER,
+        "Accept": "*/*"
+      }
+    }
+  );
+
+  const location =
+    response.headers.get("location");
+
+  if (!location) {
+    return streamUrl;
+  }
+
+  return new URL(
+    location,
+    streamUrl
+  ).href;
+}
+
+async function playlist(channelId) {
+  const streamUrl =
+    await getStreamUrl(channelId);
+
+  const finalUrl =
+    await getFinalUrl(streamUrl);
+
+  const response = await fetch(
+    finalUrl,
+    {
+      headers: {
+        "User-Agent": USER_AGENT,
+        "Referer": REFERER,
+        "Accept": "*/*"
+      },
+      cf: {
+        cacheTtl: 0,
+        cacheEverything: false
+      }
+    }
+  );
+
+  if (!response.ok) {
+    throw new Error(
+      `Playlist ${response.status}`
+    );
+  }
+
+  const text =
+    await response.text();
+
+  if (!text.includes("#EXTM3U")) {
+    throw new Error(
+      "Invalid M3U8"
+    );
+  }
+
+  /*
+   * نحول الروابط النسبية إلى روابط مطلقة.
+   * الروابط المطلقة تبقى كما هي.
+   */
+  const base =
+    new URL(finalUrl);
+
+  const output =
+    text
+      .split(/\r?\n/)
+      .map(line => {
+
+        const value =
+          line.trim();
+
+        if (
+          !value ||
+          value.startsWith("#")
+        ) {
+          return line;
+        }
+
+        try {
+          return new URL(
+            value,
+            base
+          ).href;
+        } catch {
+          return line;
+        }
+      })
+      .join("\n");
+
+  return new Response(
+    output,
+    {
+      status: 200,
+      headers: {
+        "Content-Type":
+          "application/vnd.apple.mpegurl",
+
+        "Access-Control-Allow-Origin":
+          "*",
+
+        "Cache-Control":
+          "no-store, no-cache, must-revalidate",
+
+        "Pragma":
+          "no-cache",
+
+        "Expires":
+          "0"
+      }
+    }
+  );
+}
+
+async function proxySegment(request) {
+  const incoming =
+    new URL(request.url);
+
+  const target =
+    incoming.searchParams.get("url");
+
+  if (!target) {
+    return new Response(
+      "Missing url",
+      { status: 400 }
+    );
+  }
+
+  let targetUrl;
+
+  try {
+    targetUrl =
+      new URL(target);
+  } catch {
+    return new Response(
+      "Invalid url",
+      { status: 400 }
+    );
+  }
+
+  /*
+   * نمرر Range إذا كان المشغل يستخدمه.
+   * والأهم: لا نستخدم arrayBuffer().
+   * نرجع response.body مباشرة.
+   */
+  const headers =
+    new Headers();
+
+  headers.set(
+    "User-Agent",
+    USER_AGENT
+  );
+
+  headers.set(
+    "Referer",
+    REFERER
+  );
+
+  headers.set(
+    "Accept",
+    "*/*"
+  );
+
+  const range =
+    request.headers.get("Range");
+
+  if (range) {
+    headers.set(
+      "Range",
+      range
+    );
+  }
+
+  const response =
+    await fetch(
+      targetUrl.href,
       {
-        headers: {
-          "User-Agent": USER_AGENT,
-          "Accept": "*/*"
-        },
-        cache: "no-store"
+        method:
+          request.method === "HEAD"
+            ? "HEAD"
+            : "GET",
+
+        headers,
+
+        redirect:
+          "follow"
       }
     );
 
-    if (!apiResponse.ok) {
-      return res
-        .status(502)
-        .send("Source API error: " + apiResponse.status);
-    }
+  const outputHeaders =
+    new Headers();
 
-    // 2. قراءة البيانات المشفرة
-    const encrypted = await apiResponse.text();
-
-    // 3. قراءة timestamp من Header t
-    const timestamp = apiResponse.headers.get("t");
-
-    if (!timestamp) {
-      return res
-        .status(502)
-        .send("Missing source timestamp");
-    }
-
-    // 4. فك التشفير
-    const decrypted = decrypt(
-      encrypted,
-      XOR_KEY + timestamp
+  const contentType =
+    response.headers.get(
+      "Content-Type"
     );
 
-    let data;
+  if (contentType) {
+    outputHeaders.set(
+      "Content-Type",
+      contentType
+    );
+  }
+
+  const contentLength =
+    response.headers.get(
+      "Content-Length"
+    );
+
+  if (contentLength) {
+    outputHeaders.set(
+      "Content-Length",
+      contentLength
+    );
+  }
+
+  const contentRange =
+    response.headers.get(
+      "Content-Range"
+    );
+
+  if (contentRange) {
+    outputHeaders.set(
+      "Content-Range",
+      contentRange
+    );
+  }
+
+  outputHeaders.set(
+    "Access-Control-Allow-Origin",
+    "*"
+  );
+
+  outputHeaders.set(
+    "Accept-Ranges",
+    "bytes"
+  );
+
+  outputHeaders.set(
+    "Cache-Control",
+    "no-store"
+  );
+
+  return new Response(
+    response.body,
+    {
+      status:
+        response.status,
+
+      headers:
+        outputHeaders
+    }
+  );
+}
+
+export default {
+  async fetch(request) {
+
+    const url =
+      new URL(request.url);
+
+    if (
+      request.method === "OPTIONS"
+    ) {
+      return new Response(
+        null,
+        {
+          status: 204,
+          headers: {
+            "Access-Control-Allow-Origin":
+              "*",
+
+            "Access-Control-Allow-Methods":
+              "GET,HEAD,OPTIONS",
+
+            "Access-Control-Allow-Headers":
+              "*"
+          }
+        }
+      );
+    }
 
     try {
-      data = JSON.parse(decrypted);
-    } catch {
-      return res
-        .status(502)
-        .send("Invalid decrypted JSON");
-    }
 
-    // 5. استخراج بيانات القناة
-    const channel =
-      data?.data?.[0] ||
-      data?.data ||
-      data?.channel ||
-      data;
-
-    // 6. استخراج رابط البث
-    const streamUrl =
-      channel?.url ||
-      channel?.stream_url ||
-      channel?.stream ||
-      channel?.link;
-
-    if (!streamUrl) {
-      return res
-        .status(404)
-        .send("Stream URL not found");
-    }
-
-    // 7. متابعة Redirect
-    const redirectResponse = await fetch(
-      streamUrl,
-      {
-        redirect: "manual",
-
-        headers: {
-          "User-Agent": USER_AGENT,
-          "Referer": REFERER,
-          "Accept": "*/*"
-        },
-
-        cache: "no-store"
-      }
-    );
-
-    const location =
-      redirectResponse.headers.get("location");
-
-    const finalUrl = location
-      ? new URL(location, streamUrl).href
-      : streamUrl;
-
-    // 8. جلب الـ M3U8
-    const playlistResponse = await fetch(
-      finalUrl,
-      {
-        headers: {
-          "User-Agent": USER_AGENT,
-          "Referer": REFERER,
-          "Accept": "*/*"
-        },
-
-        cache: "no-store"
-      }
-    );
-
-    if (!playlistResponse.ok) {
-      return res
-        .status(playlistResponse.status)
-        .send(
-          "Playlist error: " +
-          playlistResponse.status
+      /*
+       * /live/4.m3u8
+       */
+      const match =
+        url.pathname.match(
+          /^\/live\/([^/]+)\.m3u8$/
         );
-    }
 
-    const playlist =
-      await playlistResponse.text();
+      if (match) {
 
-    // 9. التأكد أنه M3U8
-    if (!playlist.includes("#EXTM3U")) {
-      return res
-        .status(502)
-        .send("Invalid M3U8 playlist");
-    }
+        const channelId =
+          match[1];
 
-    // 10. Headers
-    res.setHeader(
-      "Content-Type",
-      "application/vnd.apple.mpegurl"
-    );
+        return await playlist(
+          channelId
+        );
+      }
 
-    res.setHeader(
-      "Access-Control-Allow-Origin",
-      "*"
-    );
+      /*
+       * /segment?url=...
+       */
+      if (
+        url.pathname ===
+        "/segment"
+      ) {
+        return await proxySegment(
+          request
+        );
+      }
 
-    res.setHeader(
-      "Access-Control-Allow-Methods",
-      "GET, OPTIONS"
-    );
-
-    res.setHeader(
-      "Access-Control-Allow-Headers",
-      "*"
-    );
-
-    res.setHeader(
-      "Cache-Control",
-      "no-store, no-cache, must-revalidate, proxy-revalidate"
-    );
-
-    res.setHeader(
-      "Pragma",
-      "no-cache"
-    );
-
-    res.setHeader(
-      "Expires",
-      "0"
-    );
-
-    // 11. إرجاع الـ M3U8 الأصلي
-    return res
-      .status(200)
-      .send(playlist);
-
-  } catch (error) {
-
-    console.error(error);
-
-    return res
-      .status(500)
-      .send(
-        "Server error: " +
-        error.message
+      return new Response(
+        "IQTV Worker OK",
+        {
+          status: 200
+        }
       );
+
+    } catch (error) {
+
+      return new Response(
+        "Stream error: " +
+        error.message,
+        {
+          status: 502,
+          headers: {
+            "Content-Type":
+              "text/plain; charset=utf-8"
+          }
+        }
+      );
+    }
   }
-}
+};
